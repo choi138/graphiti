@@ -88,6 +88,7 @@ database:
 
 graphiti:
   group_id: ${GRAPHITI_GROUP_ID:main}
+  search_mode: ${GRAPHITI_SEARCH_MODE:hybrid}
   episode_id_prefix: ${EPISODE_ID_PREFIX:}
   user_id: ${USER_ID:mcp_user}
   entity_types:

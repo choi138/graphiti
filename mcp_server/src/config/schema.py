@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -250,6 +250,9 @@ class GraphitiAppConfig(BaseModel):
     """Graphiti-specific configuration."""
 
     group_id: str = Field(default='main', description='Group ID')
+    search_mode: Literal['hybrid', 'bm25'] = Field(
+        default='hybrid', description='Read-search mode; hybrid preserves semantic + BM25 search'
+    )
     episode_id_prefix: str | None = Field(default='', description='Episode ID prefix')
     user_id: str = Field(default='mcp_user', description='User ID')
     entity_types: list[EntityTypeConfig] = Field(default_factory=list)

@@ -17,6 +17,15 @@ from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
+from graphiti_core.search.search_config import (
+    EdgeReranker,
+    EdgeSearchConfig,
+    EdgeSearchMethod,
+    NodeReranker,
+    NodeSearchConfig,
+    NodeSearchMethod,
+    SearchConfig,
+)
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -197,6 +206,38 @@ queue_service: QueueService | None = None
 # Global client for backward compatibility
 graphiti_client: Graphiti | None = None
 semaphore: asyncio.Semaphore
+
+
+def _node_read_search_config(
+    search_mode: str, max_nodes: int, center_node_uuid: str | None
+) -> SearchConfig:
+    from graphiti_core.search.search_config_recipes import (
+        NODE_HYBRID_SEARCH_NODE_DISTANCE,
+        NODE_HYBRID_SEARCH_RRF,
+    )
+
+    if search_mode == 'hybrid':
+        return NODE_HYBRID_SEARCH_NODE_DISTANCE if center_node_uuid else NODE_HYBRID_SEARCH_RRF
+
+    return SearchConfig(
+        node_config=NodeSearchConfig(
+            search_methods=[NodeSearchMethod.bm25],
+            reranker=NodeReranker.node_distance if center_node_uuid else NodeReranker.rrf,
+        ),
+        limit=max_nodes,
+    )
+
+
+def _edge_bm25_search_config(
+    max_facts: int, center_node_uuid: str | None
+) -> SearchConfig:
+    return SearchConfig(
+        edge_config=EdgeSearchConfig(
+            search_methods=[EdgeSearchMethod.bm25],
+            reranker=EdgeReranker.node_distance if center_node_uuid else EdgeReranker.rrf,
+        ),
+        limit=max_facts,
+    )
 
 
 class GraphitiService:
@@ -533,16 +574,8 @@ async def search_nodes(
             node_labels=entity_types,
         )
 
-        # center_node_uuid is only honored by the node_distance reranker, so select
-        # that recipe when a center node is given (mirroring core's Graphiti.search);
-        # otherwise use RRF.
-        from graphiti_core.search.search_config_recipes import (
-            NODE_HYBRID_SEARCH_NODE_DISTANCE,
-            NODE_HYBRID_SEARCH_RRF,
-        )
-
-        node_config = (
-            NODE_HYBRID_SEARCH_NODE_DISTANCE if center_node_uuid else NODE_HYBRID_SEARCH_RRF
+        node_config = _node_read_search_config(
+            config.graphiti.search_mode, max_nodes, center_node_uuid
         )
         results = await client.search_(
             query=query,
@@ -629,13 +662,23 @@ async def search_memory_facts(
             else []
         )
 
-        relevant_edges = await client.search(
-            group_ids=effective_group_ids,
-            query=query,
-            num_results=max_facts,
-            center_node_uuid=center_node_uuid,
-            search_filter=search_filter,
-        )
+        if config.graphiti.search_mode == 'bm25':
+            results = await client.search_(
+                group_ids=effective_group_ids,
+                query=query,
+                config=_edge_bm25_search_config(max_facts, center_node_uuid),
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filter,
+            )
+            relevant_edges = results.edges[:max_facts] if results.edges else []
+        else:
+            relevant_edges = await client.search(
+                group_ids=effective_group_ids,
+                query=query,
+                num_results=max_facts,
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filter,
+            )
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])

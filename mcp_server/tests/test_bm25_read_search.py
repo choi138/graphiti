@@ -1,0 +1,149 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from graphiti_core.search.search import search as core_search
+from graphiti_core.search.search_config import (
+    EdgeReranker,
+    EdgeSearchMethod,
+    NodeReranker,
+    NodeSearchMethod,
+)
+from graphiti_core.search.search_config_recipes import (
+    NODE_HYBRID_SEARCH_NODE_DISTANCE,
+    NODE_HYBRID_SEARCH_RRF,
+)
+from graphiti_core.search.search_filters import SearchFilters
+from pydantic import ValidationError
+
+import graphiti_mcp_server as server
+from config.schema import GraphitiAppConfig, GraphitiConfig
+
+
+def test_search_mode_defaults_to_hybrid_and_rejects_unknown_value():
+    assert GraphitiAppConfig().search_mode == 'hybrid'
+    with pytest.raises(ValidationError):
+        GraphitiAppConfig(search_mode='semantic-fallback')
+
+
+def test_default_node_search_configuration_is_unchanged():
+    assert server._node_read_search_config('hybrid', 7, None) is NODE_HYBRID_SEARCH_RRF
+    assert (
+        server._node_read_search_config('hybrid', 7, 'center')
+        is NODE_HYBRID_SEARCH_NODE_DISTANCE
+    )
+
+
+def test_bm25_search_configurations_have_only_bm25_and_preserve_limits():
+    node_config = server._node_read_search_config('bm25', 7, None)
+    assert node_config.limit == 7
+    assert node_config.node_config.search_methods == [NodeSearchMethod.bm25]
+    assert node_config.node_config.reranker == NodeReranker.rrf
+
+    centered_node_config = server._node_read_search_config('bm25', 8, 'center')
+    assert centered_node_config.node_config.search_methods == [NodeSearchMethod.bm25]
+    assert centered_node_config.node_config.reranker == NodeReranker.node_distance
+
+    edge_config = server._edge_bm25_search_config(9, None)
+    assert edge_config.limit == 9
+    assert edge_config.edge_config.search_methods == [EdgeSearchMethod.bm25]
+    assert edge_config.edge_config.reranker == EdgeReranker.rrf
+
+    centered_edge_config = server._edge_bm25_search_config(6, 'center')
+    assert centered_edge_config.edge_config.search_methods == [EdgeSearchMethod.bm25]
+    assert centered_edge_config.edge_config.reranker == EdgeReranker.node_distance
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'config',
+    [
+        server._node_read_search_config('bm25', 4, None),
+        server._edge_bm25_search_config(4, None),
+    ],
+)
+async def test_bm25_core_search_never_calls_embedder(monkeypatch, config):
+    async def no_results(*args, **kwargs):
+        return []
+
+    async def fail_if_embedded(*args, **kwargs):
+        raise AssertionError('BM25-only search called the embedder')
+
+    monkeypatch.setattr('graphiti_core.search.search.node_fulltext_search', no_results)
+    monkeypatch.setattr('graphiti_core.search.search.edge_fulltext_search', no_results)
+    clients = SimpleNamespace(
+        driver=SimpleNamespace(),
+        embedder=SimpleNamespace(create=fail_if_embedded),
+        cross_encoder=SimpleNamespace(),
+    )
+
+    results = await core_search(
+        clients,
+        query='keyword',
+        group_ids=['g'],
+        config=config,
+        search_filter=SearchFilters(),
+    )
+
+    assert results.nodes == []
+    assert results.edges == []
+
+
+@pytest.mark.asyncio
+async def test_bm25_fact_search_uses_explicit_config_and_preserves_filters(monkeypatch):
+    client = SimpleNamespace(search=AsyncMock(), search_=AsyncMock(return_value=SimpleNamespace(edges=[])))
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts(
+        'query',
+        group_ids=['g'],
+        max_facts=4,
+        center_node_uuid='center',
+        edge_types=['RELATES_TO'],
+        valid_at_after='2024-01-01T00:00:00Z',
+    )
+
+    assert response['facts'] == []
+    client.search.assert_not_awaited()
+    kwargs = client.search_.await_args.kwargs
+    assert kwargs['config'].limit == 4
+    assert kwargs['config'].edge_config.search_methods == [EdgeSearchMethod.bm25]
+    assert kwargs['group_ids'] == ['g']
+    assert kwargs['center_node_uuid'] == 'center'
+    assert kwargs['search_filter'].edge_types == ['RELATES_TO']
+    assert kwargs['search_filter'].valid_at[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_hybrid_fact_search_keeps_existing_client_search_call(monkeypatch):
+    client = SimpleNamespace(search=AsyncMock(return_value=[]), search_=AsyncMock())
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', group_ids='g', max_facts=3)
+
+    assert response['facts'] == []
+    client.search_.assert_not_awaited()
+    client.search.assert_awaited_once()
+    assert client.search.await_args.kwargs['num_results'] == 3
+    assert client.search.await_args.kwargs['group_ids'] == ['g']
+
+
+@pytest.mark.asyncio
+async def test_bm25_errors_remain_explicit(monkeypatch):
+    client = SimpleNamespace(search_=AsyncMock(side_effect=RuntimeError('database unavailable')))
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query')
+
+    assert response['error'] == 'Error searching facts: database unavailable'
