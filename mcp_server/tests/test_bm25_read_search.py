@@ -1,7 +1,10 @@
+import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from graphiti_core.nodes import EntityNode
 from graphiti_core.search.search import search as core_search
 from graphiti_core.search.search_config import (
     EdgeReranker,
@@ -14,16 +17,37 @@ from graphiti_core.search.search_config_recipes import (
     NODE_HYBRID_SEARCH_RRF,
 )
 from graphiti_core.search.search_filters import SearchFilters
+from neo4j.time import DateTime as Neo4jDateTime
 from pydantic import ValidationError
 
 import graphiti_mcp_server as server
 from config.schema import GraphitiAppConfig, GraphitiConfig
+from utils.formatting import to_node_result
 
 
 def test_search_mode_defaults_to_hybrid_and_rejects_unknown_value():
     assert GraphitiAppConfig().search_mode == 'hybrid'
     with pytest.raises(ValidationError):
         GraphitiAppConfig(search_mode='semantic-fallback')
+
+
+def test_node_result_attributes_are_json_safe_for_neo4j_temporal_values():
+    node = EntityNode(
+        uuid='node-1',
+        name='Example',
+        group_id='g',
+        created_at=datetime(2026, 7, 28, tzinfo=timezone.utc),
+        attributes={
+            'observed_at': Neo4jDateTime(2026, 7, 28, 12, 34, 56),
+            'nested': [Neo4jDateTime(2026, 7, 27, 1, 2, 3)],
+        },
+    )
+
+    result = to_node_result(node)
+
+    assert result['attributes']['observed_at'] == '2026-07-28T12:34:56.000000000'
+    assert result['attributes']['nested'] == ['2026-07-27T01:02:03.000000000']
+    json.dumps(result)
 
 
 def test_default_node_search_configuration_is_unchanged():

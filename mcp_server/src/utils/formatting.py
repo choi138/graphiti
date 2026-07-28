@@ -1,5 +1,6 @@
 """Formatting utilities for Graphiti MCP Server."""
 
+from collections.abc import Mapping
 from typing import Any
 
 from graphiti_core.edges import EntityEdge
@@ -8,10 +9,28 @@ from graphiti_core.nodes import EntityNode
 from models.response_types import EdgeResult, NodeResult
 
 
+def _json_safe_attribute(value: Any) -> Any:
+    """Recursively serialize temporal values returned by database drivers."""
+    if isinstance(value, Mapping):
+        return {key: _json_safe_attribute(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_attribute(item) for item in value]
+
+    isoformat = getattr(value, 'isoformat', None)
+    if callable(isoformat):
+        return isoformat()
+
+    return value
+
+
 def to_node_result(node: EntityNode) -> NodeResult:
     """Build a NodeResult TypedDict from an EntityNode, dropping embeddings."""
     attrs = node.attributes if node.attributes else {}
-    attrs = {k: v for k, v in attrs.items() if 'embedding' not in k.lower()}
+    attrs = {
+        key: _json_safe_attribute(value)
+        for key, value in attrs.items()
+        if 'embedding' not in key.lower()
+    }
     return NodeResult(
         uuid=node.uuid,
         name=node.name,
