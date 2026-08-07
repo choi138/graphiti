@@ -16,7 +16,7 @@ from uuid import uuid4
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
 from graphiti_core.edges import EntityEdge
-from graphiti_core.nodes import EntityNode, EpisodeType, SagaNode
+from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode, SagaNode
 from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.utils.maintenance.graph_data_operations import clear_data
 from mcp.server.fastmcp import FastMCP
@@ -155,7 +155,8 @@ Core tools:
 - summarize_saga: generate or refresh the running summary of a saga's episodes.
 - build_communities: detect entity communities and produce higher-level community summaries.
 - get_episode_entities: trace provenance — the entities and facts created by specific episode UUIDs.
-- get_entity_edge / get_episodes: retrieve specific facts or episodes.
+- get_entity_edge / get_episodes / get_episodes_by_uuid: retrieve specific facts or episodes.
+- search_episodes: retrieve raw episodes by group, source label, lexical query, and event time.
 - delete_episode: remove an episode and cascade-delete the entities/facts it solely created.
 - delete_entity_edge / clear_graph: remove a fact, or clear a group's data.
 
@@ -353,6 +354,32 @@ class GraphitiService:
         if self.client is None:
             raise RuntimeError('Failed to initialize Graphiti client')
         return self.client
+
+
+def _isoformat(value: Any) -> str | None:
+    """Serialize Python and Neo4j datetime values without exposing driver types."""
+    if value is None:
+        return None
+    if hasattr(value, 'iso_format'):
+        return value.iso_format()
+    if hasattr(value, 'isoformat'):
+        return value.isoformat()
+    return str(value)
+
+
+def _format_episode_result(episode: EpisodicNode) -> dict[str, Any]:
+    return {
+        'uuid': episode.uuid,
+        'name': episode.name,
+        'content': episode.content,
+        'created_at': _isoformat(episode.created_at),
+        'valid_at': _isoformat(episode.valid_at),
+        'source': episode.source.value
+        if hasattr(episode.source, 'value')
+        else str(episode.source),
+        'source_description': episode.source_description,
+        'group_id': episode.group_id,
+    }
 
 
 @mcp.tool()
@@ -760,9 +787,6 @@ async def get_episodes(
             else []
         )
 
-        # Get episodes from the driver directly
-        from graphiti_core.nodes import EpisodicNode
-
         if effective_group_ids:
             episodes = await EpisodicNode.get_by_group_ids(
                 client.driver, effective_group_ids, limit=max_episodes
@@ -775,21 +799,7 @@ async def get_episodes(
         if not episodes:
             return EpisodeSearchResponse(message='No episodes found', episodes=[])
 
-        # Format the results
-        episode_results = []
-        for episode in episodes:
-            episode_dict = {
-                'uuid': episode.uuid,
-                'name': episode.name,
-                'content': episode.content,
-                'created_at': episode.created_at.isoformat() if episode.created_at else None,
-                'source': episode.source.value
-                if hasattr(episode.source, 'value')
-                else str(episode.source),
-                'source_description': episode.source_description,
-                'group_id': episode.group_id,
-            }
-            episode_results.append(episode_dict)
+        episode_results = [_format_episode_result(episode) for episode in episodes]
 
         return EpisodeSearchResponse(
             message='Episodes retrieved successfully', episodes=episode_results
@@ -798,6 +808,155 @@ async def get_episodes(
         error_msg = str(e)
         logger.error(f'Error getting episodes: {error_msg}')
         return ErrorResponse(error=f'Error getting episodes: {error_msg}')
+
+
+@mcp.tool()
+async def get_episodes_by_uuid(
+    episode_uuids: list[str],
+) -> EpisodeSearchResponse | ErrorResponse:
+    """Get raw episodes by UUID for provenance-backed memory recall.
+
+    Args:
+        episode_uuids: One to twenty episode UUIDs to retrieve.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    normalized_uuids = list(dict.fromkeys(uuid.strip() for uuid in episode_uuids if uuid.strip()))
+    if not normalized_uuids:
+        return ErrorResponse(error='At least one episode UUID is required')
+    if len(normalized_uuids) > 20:
+        return ErrorResponse(error='At most 20 episode UUIDs may be requested')
+
+    try:
+        client = await graphiti_service.get_client()
+        episodes = await EpisodicNode.get_by_uuids(client.driver, normalized_uuids)
+        episodes_by_uuid = {episode.uuid: episode for episode in episodes}
+        ordered = [episodes_by_uuid[uuid] for uuid in normalized_uuids if uuid in episodes_by_uuid]
+        return EpisodeSearchResponse(
+            message='Episodes retrieved successfully' if ordered else 'No episodes found',
+            episodes=[_format_episode_result(episode) for episode in ordered],
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error getting episodes by UUID: {error_msg}')
+        return ErrorResponse(error=f'Error getting episodes by UUID: {error_msg}')
+
+
+@mcp.tool()
+async def search_episodes(
+    group_id: str,
+    query: str | None = None,
+    source_query: str | None = None,
+    valid_at_after: str | None = None,
+    valid_at_before: str | None = None,
+    max_episodes: int = 10,
+) -> EpisodeSearchResponse | ErrorResponse:
+    """Search raw episodes in reverse event-time order using read-only filters.
+
+    ``query`` performs a case-insensitive lexical match over episode name, content,
+    and source description. ``source_query`` matches episode name or source
+    description. The lower time bound is inclusive and the upper bound is exclusive.
+
+    Args:
+        group_id: Exact graph group to search. This argument is required.
+        query: Optional lexical query for a meeting, conversation, document, or event.
+        source_query: Optional source label such as Claude, Notion, or Slack.
+        valid_at_after: Optional inclusive ISO-8601 event-time lower bound.
+        valid_at_before: Optional exclusive ISO-8601 event-time upper bound.
+        max_episodes: Maximum number of episodes to return, from 1 to 100.
+    """
+    global graphiti_service
+
+    if graphiti_service is None:
+        return ErrorResponse(error='Graphiti service not initialized')
+
+    normalized_group_id = group_id.strip()
+    if not normalized_group_id:
+        return ErrorResponse(error='group_id is required')
+    if max_episodes < 1 or max_episodes > 100:
+        return ErrorResponse(error='max_episodes must be between 1 and 100')
+
+    try:
+        after = parse_reference_time(valid_at_after)
+        before = parse_reference_time(valid_at_before)
+        if after is not None and before is not None and after >= before:
+            return ErrorResponse(error='valid_at_after must be earlier than valid_at_before')
+
+        clauses = ['e.group_id = $group_id']
+        params: dict[str, Any] = {
+            'group_id': normalized_group_id,
+            'max_episodes': max_episodes,
+        }
+
+        normalized_query = query.strip().lower() if query else ''
+        if normalized_query:
+            clauses.append(
+                "(toLower(coalesce(e.name, '')) CONTAINS $query "
+                "OR toLower(coalesce(e.content, '')) CONTAINS $query "
+                "OR toLower(coalesce(e.source_description, '')) CONTAINS $query)"
+            )
+            params['query'] = normalized_query
+
+        normalized_source = source_query.strip().lower() if source_query else ''
+        if normalized_source:
+            clauses.append(
+                "(toLower(coalesce(e.name, '')) CONTAINS $source_query "
+                "OR toLower(coalesce(e.source_description, '')) CONTAINS $source_query)"
+            )
+            params['source_query'] = normalized_source
+
+        if after is not None:
+            clauses.append('e.valid_at >= $valid_at_after')
+            params['valid_at_after'] = after
+        if before is not None:
+            clauses.append('e.valid_at < $valid_at_before')
+            params['valid_at_before'] = before
+
+        cypher = (
+            'MATCH (e:Episodic) WHERE '
+            + ' AND '.join(clauses)
+            + '''
+            RETURN e.uuid AS uuid,
+                   e.name AS name,
+                   e.group_id AS group_id,
+                   e.created_at AS created_at,
+                   e.valid_at AS valid_at,
+                   e.source AS source,
+                   e.source_description AS source_description,
+                   e.content AS content
+            ORDER BY e.valid_at DESC, e.created_at DESC
+            LIMIT $max_episodes
+            '''
+        )
+
+        client = await graphiti_service.get_client()
+        records, _, _ = await client.driver.execute_query(cypher, routing_='r', **params)
+        episodes = [
+            {
+                'uuid': record['uuid'],
+                'name': record['name'],
+                'content': record['content'],
+                'created_at': _isoformat(record['created_at']),
+                'valid_at': _isoformat(record['valid_at']),
+                'source': record['source'],
+                'source_description': record['source_description'],
+                'group_id': record['group_id'],
+            }
+            for record in records
+        ]
+        return EpisodeSearchResponse(
+            message='Episodes retrieved successfully' if episodes else 'No episodes found',
+            episodes=episodes,
+        )
+    except ValueError as e:
+        return ErrorResponse(error=f'Invalid episode search filter: {e}')
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f'Error searching episodes: {error_msg}')
+        return ErrorResponse(error=f'Error searching episodes: {error_msg}')
 
 
 @mcp.tool()
