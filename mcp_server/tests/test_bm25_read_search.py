@@ -16,7 +16,7 @@ from graphiti_core.search.search_config_recipes import (
     NODE_HYBRID_SEARCH_NODE_DISTANCE,
     NODE_HYBRID_SEARCH_RRF,
 )
-from graphiti_core.search.search_filters import SearchFilters
+from graphiti_core.search.search_filters import ComparisonOperator, SearchFilters
 from neo4j.time import DateTime as Neo4jDateTime
 from pydantic import ValidationError
 
@@ -129,6 +129,7 @@ async def test_bm25_fact_search_uses_explicit_config_and_preserves_filters(monke
         center_node_uuid='center',
         edge_types=['RELATES_TO'],
         valid_at_after='2024-01-01T00:00:00Z',
+        temporal_mode='current',
     )
 
     assert response['facts'] == []
@@ -140,6 +141,28 @@ async def test_bm25_fact_search_uses_explicit_config_and_preserves_filters(monke
     assert kwargs['center_node_uuid'] == 'center'
     assert kwargs['search_filter'].edge_types == ['RELATES_TO']
     assert kwargs['search_filter'].valid_at[0] is not None
+    assert (
+        kwargs['search_filter'].invalid_at[0][0].comparison_operator == ComparisonOperator.is_null
+    )
+    assert (
+        kwargs['search_filter'].expired_at[0][0].comparison_operator == ComparisonOperator.is_null
+    )
+
+
+@pytest.mark.asyncio
+async def test_fact_search_surfaces_contradictory_temporal_filter(monkeypatch):
+    service = SimpleNamespace(get_client=AsyncMock())
+    monkeypatch.setattr(server, 'graphiti_service', service)
+
+    response = await server.search_memory_facts(
+        'query',
+        invalid_at_after='2026-01-01T00:00:00Z',
+        temporal_mode='current',
+    )
+
+    assert response['error'].startswith('Invalid date filter:')
+    assert 'cannot be combined' in response['error']
+    service.get_client.assert_not_awaited()
 
 
 @pytest.mark.asyncio
