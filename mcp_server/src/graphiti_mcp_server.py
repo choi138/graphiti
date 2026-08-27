@@ -240,6 +240,39 @@ def _edge_bm25_search_config(
     )
 
 
+_BM25_RERANK_QUERY = """
+MATCH ()-[r:RELATES_TO]->()
+WHERE r.uuid IN $uuids
+  AND r.fact_embedding IS NOT NULL
+  AND r.invalid_at IS NULL
+  AND r.expired_at IS NULL
+RETURN r.uuid AS uuid,
+       vector.similarity.cosine(r.fact_embedding, $qv) AS similarity
+"""
+
+
+async def _rerank_bm25_edges(
+    client: Graphiti,
+    query: str,
+    candidates: list[EntityEdge],
+    max_facts: int,
+) -> tuple[list[EntityEdge], dict[str, float]]:
+    query_vector = await client.embedder.create(input_data=[query.replace('\n', ' ')])
+    records, _, _ = await client.driver.execute_query(
+        _BM25_RERANK_QUERY,
+        uuids=[edge.uuid for edge in candidates],
+        qv=query_vector,
+        routing_='r',
+    )
+    similarities = {record['uuid']: float(record['similarity']) for record in records}
+    reranked_edges = sorted(
+        (edge for edge in candidates if edge.uuid in similarities),
+        key=lambda edge: similarities[edge.uuid],
+        reverse=True,
+    )[:max_facts]
+    return reranked_edges, similarities
+
+
 class GraphitiService:
     """Graphiti service using the unified configuration system."""
 
@@ -662,6 +695,7 @@ async def search_memory_facts(
             else []
         )
 
+        similarities: dict[str, float] = {}
         if config.graphiti.search_mode == 'bm25':
             results = await client.search_(
                 group_ids=effective_group_ids,
@@ -671,6 +705,27 @@ async def search_memory_facts(
                 search_filter=search_filter,
             )
             relevant_edges = results.edges[:max_facts] if results.edges else []
+        elif config.graphiti.search_mode == 'bm25_rerank':
+            results = await client.search_(
+                group_ids=effective_group_ids,
+                query=query,
+                config=_edge_bm25_search_config(
+                    config.graphiti.rerank_candidates, center_node_uuid
+                ),
+                center_node_uuid=center_node_uuid,
+                search_filter=search_filter,
+            )
+            candidates = results.edges[: config.graphiti.rerank_candidates] if results.edges else []
+            if candidates:
+                try:
+                    relevant_edges, similarities = await _rerank_bm25_edges(
+                        client, query, candidates, max_facts
+                    )
+                except Exception as e:
+                    logger.warning('BM25 rerank failed; falling back to plain BM25 order: %s', e)
+                    relevant_edges = candidates[:max_facts]
+            else:
+                relevant_edges = []
         else:
             relevant_edges = await client.search(
                 group_ids=effective_group_ids,
@@ -683,7 +738,11 @@ async def search_memory_facts(
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
-        facts = [format_fact_result(edge) for edge in relevant_edges]
+        facts = []
+        for edge in relevant_edges:
+            fact = format_fact_result(edge)
+            fact['similarity'] = similarities.get(edge.uuid)
+            facts.append(fact)
         return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
     except Exception as e:
         error_msg = str(e)

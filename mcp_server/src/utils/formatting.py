@@ -42,7 +42,7 @@ def to_node_result(node: EntityNode) -> NodeResult:
     )
 
 
-def to_edge_result(edge: EntityEdge) -> EdgeResult:
+def to_edge_result(edge: EntityEdge, similarity: float | None = None) -> EdgeResult:
     """Build an EdgeResult TypedDict from an EntityEdge."""
     return EdgeResult(
         uuid=edge.uuid,
@@ -54,6 +54,7 @@ def to_edge_result(edge: EntityEdge) -> EdgeResult:
         created_at=edge.created_at.isoformat() if edge.created_at else None,
         valid_at=edge.valid_at.isoformat() if edge.valid_at else None,
         invalid_at=edge.invalid_at.isoformat() if edge.invalid_at else None,
+        similarity=similarity,
     )
 
 

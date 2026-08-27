@@ -74,6 +74,7 @@ class EdgeResult(TypedDict):
     created_at: str | None
     valid_at: str | None
     invalid_at: str | None
+    similarity: float | None
 
 
 class TripletResponse(TypedDict):

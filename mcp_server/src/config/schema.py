@@ -250,8 +250,15 @@ class GraphitiAppConfig(BaseModel):
     """Graphiti-specific configuration."""
 
     group_id: str = Field(default='main', description='Group ID')
-    search_mode: Literal['hybrid', 'bm25'] = Field(
-        default='hybrid', description='Read-search mode; hybrid preserves semantic + BM25 search'
+    search_mode: Literal['hybrid', 'bm25', 'bm25_rerank'] = Field(
+        default='hybrid',
+        description='Read-search mode; hybrid preserves semantic + BM25 search',
+    )
+    rerank_candidates: int = Field(
+        default=200,
+        ge=1,
+        le=1000,
+        description='Number of BM25 candidates to cosine-rerank',
     )
     episode_id_prefix: str | None = Field(default='', description='Episode ID prefix')
     user_id: str = Field(default='mcp_user', description='User ID')
