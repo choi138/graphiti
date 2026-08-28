@@ -6,6 +6,7 @@ Graphiti MCP Server - Exposes Graphiti functionality through the Model Context P
 import argparse
 import asyncio
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timezone
@@ -674,15 +675,60 @@ async def search_memory_facts(
                 search_filter=search_filter,
             )
             relevant_edges = results.edges[:max_facts] if results.edges else []
-            # The node_distance reranker (used only when center_node_uuid is
-            # given) scores SOURCE NODES, not edges: core expands one node
-            # score into every edge sharing that source, so the score list is
-            # not index-aligned with the returned edges. Suppress scores there
-            # rather than attach a neighbouring node's value to a fact.
-            if center_node_uuid:
+            score_mode = os.environ.get('GRAPHITI_FACT_SCORE_MODE', 'rank')
+            if score_mode not in {'rank', 'semantic', 'none'}:
+                logger.warning(
+                    'Unknown GRAPHITI_FACT_SCORE_MODE %r; falling back to rank scores', score_mode
+                )
+                score_mode = 'rank'
+
+            if score_mode == 'semantic' and relevant_edges:
+                try:
+                    query_vec = await client.embedder.create(input_data=[query])
+                    records, _, _ = await client.driver.execute_query(
+                        """
+                        MATCH (n)-[e:RELATES_TO]->(m)
+                        WHERE e.uuid IN $uuids
+                        RETURN e.uuid AS uuid, e.fact_embedding AS emb
+                        """,
+                        uuids=[edge.uuid for edge in relevant_edges],
+                        routing_='r',
+                    )
+                    embeddings = {record['uuid']: record['emb'] for record in records}
+                    query_norm = math.sqrt(sum(value * value for value in query_vec))
+                    scores = []
+                    for edge in relevant_edges:
+                        embedding = embeddings.get(edge.uuid)
+                        if embedding is None or len(embedding) != len(query_vec) or query_norm == 0:
+                            scores.append(None)
+                            continue
+
+                        embedding_norm = math.sqrt(sum(value * value for value in embedding))
+                        if embedding_norm == 0:
+                            scores.append(None)
+                            continue
+
+                        dot_product = sum(
+                            query_value * embedding_value
+                            for query_value, embedding_value in zip(
+                                query_vec, embedding, strict=True
+                            )
+                        )
+                        scores.append(round(dot_product / (query_norm * embedding_norm), 6))
+                except Exception as e:
+                    logger.warning('Failed to compute semantic fact scores: %s', e)
+                    scores = []
+            elif score_mode == 'rank' and center_node_uuid:
+                # The node_distance reranker (used only when center_node_uuid is
+                # given) scores SOURCE NODES, not edges: core expands one node
+                # score into every edge sharing that source, so the score list is
+                # not index-aligned with the returned edges. Suppress scores there
+                # rather than attach a neighbouring node's value to a fact.
                 scores = []
-            else:
+            elif score_mode == 'rank':
                 scores = list(results.edge_reranker_scores or [])[:max_facts]
+            else:
+                scores = []
         else:
             relevant_edges = await client.search(
                 group_ids=effective_group_ids,

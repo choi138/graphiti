@@ -176,6 +176,7 @@ async def test_bm25_fact_search_uses_explicit_config_and_preserves_filters(monke
 async def test_bm25_fact_search_exposes_available_reranker_scores(
     monkeypatch, scores, expected_scores
 ):
+    monkeypatch.delenv('GRAPHITI_FACT_SCORE_MODE', raising=False)
     edges = [_edge('edge-1'), _edge('edge-2'), _edge('edge-3')]
     client = SimpleNamespace(
         search=AsyncMock(),
@@ -202,6 +203,7 @@ async def test_bm25_fact_search_suppresses_scores_for_centered_search(monkeypatc
     per SOURCE NODE. Core expands one node score across every edge sharing that
     source, so the list is not index-aligned with the returned edges — emitting
     it would attach another node's score to a fact. Scores must be omitted."""
+    monkeypatch.delenv('GRAPHITI_FACT_SCORE_MODE', raising=False)
     edges = [_edge('edge-1'), _edge('edge-2'), _edge('edge-3')]
     client = SimpleNamespace(
         search=AsyncMock(),
@@ -221,6 +223,123 @@ async def test_bm25_fact_search_suppresses_scores_for_centered_search(monkeypatc
     assert len(response['facts']) == 3
     for fact in response['facts']:
         assert 'score' not in fact
+
+
+@pytest.mark.asyncio
+async def test_bm25_fact_search_semantic_scores(monkeypatch):
+    edges = [_edge('edge-1'), _edge('edge-2')]
+    embedder = SimpleNamespace(create=AsyncMock(return_value=[1.0, 2.0, 2.0]))
+    driver = SimpleNamespace(
+        execute_query=AsyncMock(
+            return_value=(
+                [
+                    {'uuid': 'edge-1', 'emb': [1.0, 2.0, 2.0]},
+                    {'uuid': 'edge-2', 'emb': [0.0, 3.0, 4.0]},
+                ],
+                None,
+                None,
+            )
+        )
+    )
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(return_value=SimpleNamespace(edges=edges, edge_reranker_scores=[])),
+        embedder=embedder,
+        driver=driver,
+    )
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setenv('GRAPHITI_FACT_SCORE_MODE', 'semantic')
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', max_facts=2)
+
+    assert [fact['score'] for fact in response['facts']] == [1.0, 0.933333]
+    embedder.create.assert_awaited_once_with(input_data=['query'])
+    query = driver.execute_query.await_args.args[0]
+    assert 'WHERE e.uuid IN $uuids' in query
+    assert 'ORDER BY' not in query
+    assert driver.execute_query.await_args.kwargs['uuids'] == ['edge-1', 'edge-2']
+
+
+@pytest.mark.asyncio
+async def test_bm25_fact_search_semantic_scores_omit_missing_embeddings(monkeypatch):
+    edges = [_edge('edge-1'), _edge('edge-2')]
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(return_value=SimpleNamespace(edges=edges, edge_reranker_scores=[])),
+        embedder=SimpleNamespace(create=AsyncMock(return_value=[1.0, 0.0, 0.0])),
+        driver=SimpleNamespace(
+            execute_query=AsyncMock(
+                return_value=([{'uuid': 'edge-1', 'emb': [0.0, 1.0, 0.0]}], None, None)
+            )
+        ),
+    )
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setenv('GRAPHITI_FACT_SCORE_MODE', 'semantic')
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', max_facts=2)
+
+    assert response['facts'][0]['score'] == 0.0
+    assert 'score' not in response['facts'][1]
+
+
+@pytest.mark.asyncio
+async def test_bm25_fact_search_semantic_scores_isolate_embedder_failures(monkeypatch):
+    edges = [_edge('edge-1'), _edge('edge-2')]
+    embedder = SimpleNamespace(create=AsyncMock(side_effect=RuntimeError('embedder unavailable')))
+    driver = SimpleNamespace(execute_query=AsyncMock())
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(return_value=SimpleNamespace(edges=edges, edge_reranker_scores=[])),
+        embedder=embedder,
+        driver=driver,
+    )
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setenv('GRAPHITI_FACT_SCORE_MODE', 'semantic')
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', max_facts=2)
+
+    assert len(response['facts']) == 2
+    assert all('score' not in fact for fact in response['facts'])
+    driver.execute_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bm25_fact_search_none_mode_omits_scores(monkeypatch):
+    edges = [_edge('edge-1'), _edge('edge-2')]
+    embedder = SimpleNamespace(create=AsyncMock())
+    driver = SimpleNamespace(execute_query=AsyncMock())
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(
+            return_value=SimpleNamespace(edges=edges, edge_reranker_scores=[1.0, 0.5])
+        ),
+        embedder=embedder,
+        driver=driver,
+    )
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setenv('GRAPHITI_FACT_SCORE_MODE', 'none')
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', max_facts=2)
+
+    assert all('score' not in fact for fact in response['facts'])
+    embedder.create.assert_not_awaited()
+    driver.execute_query.assert_not_awaited()
 
 
 @pytest.mark.asyncio
