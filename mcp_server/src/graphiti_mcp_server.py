@@ -676,6 +676,7 @@ async def search_memory_facts(
                 search_filter=search_filter,
             )
             relevant_edges = results.edges[:max_facts] if results.edges else []
+            scores = list(results.edge_reranker_scores or [])[:max_facts]
         else:
             relevant_edges = await client.search(
                 group_ids=effective_group_ids,
@@ -684,11 +685,15 @@ async def search_memory_facts(
                 center_node_uuid=center_node_uuid,
                 search_filter=search_filter,
             )
+            scores = []
 
         if not relevant_edges:
             return FactSearchResponse(message='No relevant facts found', facts=[])
 
-        facts = [format_fact_result(edge) for edge in relevant_edges]
+        facts = [
+            format_fact_result(edge, score=(scores[i] if i < len(scores) else None))
+            for i, edge in enumerate(relevant_edges)
+        ]
         return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
     except Exception as e:
         error_msg = str(e)

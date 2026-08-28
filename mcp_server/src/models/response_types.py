@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 
 class ErrorResponse(TypedDict):
@@ -74,6 +74,7 @@ class EdgeResult(TypedDict):
     created_at: str | None
     valid_at: str | None
     invalid_at: str | None
+    score: NotRequired[float]
 
 
 class TripletResponse(TypedDict):

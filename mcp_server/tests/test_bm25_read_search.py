@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from graphiti_core.edges import EntityEdge
 from graphiti_core.nodes import EntityNode
 from graphiti_core.search.search import search as core_search
 from graphiti_core.search.search_config import (
@@ -23,6 +24,18 @@ from pydantic import ValidationError
 import graphiti_mcp_server as server
 from config.schema import GraphitiAppConfig, GraphitiConfig
 from utils.formatting import to_node_result
+
+
+def _edge(uuid: str) -> EntityEdge:
+    return EntityEdge(
+        uuid=uuid,
+        name='RELATES_TO',
+        fact=f'Fact {uuid}',
+        source_node_uuid='source',
+        target_node_uuid='target',
+        group_id='g',
+        created_at=datetime(2026, 8, 28, tzinfo=timezone.utc),
+    )
 
 
 def test_search_mode_defaults_to_hybrid_and_rejects_unknown_value():
@@ -115,7 +128,10 @@ async def test_bm25_core_search_never_calls_embedder(monkeypatch, config):
 
 @pytest.mark.asyncio
 async def test_bm25_fact_search_uses_explicit_config_and_preserves_filters(monkeypatch):
-    client = SimpleNamespace(search=AsyncMock(), search_=AsyncMock(return_value=SimpleNamespace(edges=[])))
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(return_value=SimpleNamespace(edges=[], edge_reranker_scores=[])),
+    )
     service = SimpleNamespace(get_client=AsyncMock(return_value=client))
     cfg = GraphitiConfig()
     cfg.graphiti.search_mode = 'bm25'
@@ -147,6 +163,40 @@ async def test_bm25_fact_search_uses_explicit_config_and_preserves_filters(monke
     assert (
         kwargs['search_filter'].expired_at[0][0].comparison_operator == ComparisonOperator.is_null
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('scores', 'expected_scores'),
+    [
+        ([0.12345678, 0.5, 0.98765432], [0.123457, 0.5, 0.987654]),
+        ([], [None, None, None]),
+        ([0.5], [0.5, None, None]),
+    ],
+)
+async def test_bm25_fact_search_exposes_available_reranker_scores(
+    monkeypatch, scores, expected_scores
+):
+    edges = [_edge('edge-1'), _edge('edge-2'), _edge('edge-3')]
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(
+            return_value=SimpleNamespace(edges=edges, edge_reranker_scores=scores)
+        ),
+    )
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', max_facts=3)
+
+    for fact, expected_score in zip(response['facts'], expected_scores, strict=True):
+        if expected_score is None:
+            assert 'score' not in fact
+        else:
+            assert fact['score'] == expected_score
 
 
 @pytest.mark.asyncio

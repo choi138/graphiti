@@ -42,9 +42,9 @@ def to_node_result(node: EntityNode) -> NodeResult:
     )
 
 
-def to_edge_result(edge: EntityEdge) -> EdgeResult:
+def to_edge_result(edge: EntityEdge, score: float | None = None) -> EdgeResult:
     """Build an EdgeResult TypedDict from an EntityEdge."""
-    return EdgeResult(
+    result = EdgeResult(
         uuid=edge.uuid,
         name=edge.name,
         fact=edge.fact,
@@ -55,6 +55,9 @@ def to_edge_result(edge: EntityEdge) -> EdgeResult:
         valid_at=edge.valid_at.isoformat() if edge.valid_at else None,
         invalid_at=edge.invalid_at.isoformat() if edge.invalid_at else None,
     )
+    if score is not None:
+        result['score'] = round(float(score), 6)
+    return result
 
 
 def format_node_result(node: EntityNode) -> dict[str, Any]:
@@ -80,7 +83,7 @@ def format_node_result(node: EntityNode) -> dict[str, Any]:
     return result
 
 
-def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
+def format_fact_result(edge: EntityEdge, score: float | None = None) -> dict[str, Any]:
     """Format an entity edge into a readable result.
 
     Since EntityEdge is a Pydantic BaseModel, we can use its built-in serialization capabilities.
@@ -98,4 +101,6 @@ def format_fact_result(edge: EntityEdge) -> dict[str, Any]:
         },
     )
     result.get('attributes', {}).pop('fact_embedding', None)
+    if score is not None:
+        result['score'] = round(float(score), 6)
     return result
