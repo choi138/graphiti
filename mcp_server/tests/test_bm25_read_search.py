@@ -66,8 +66,7 @@ def test_node_result_attributes_are_json_safe_for_neo4j_temporal_values():
 def test_default_node_search_configuration_is_unchanged():
     assert server._node_read_search_config('hybrid', 7, None) is NODE_HYBRID_SEARCH_RRF
     assert (
-        server._node_read_search_config('hybrid', 7, 'center')
-        is NODE_HYBRID_SEARCH_NODE_DISTANCE
+        server._node_read_search_config('hybrid', 7, 'center') is NODE_HYBRID_SEARCH_NODE_DISTANCE
     )
 
 
@@ -180,9 +179,7 @@ async def test_bm25_fact_search_exposes_available_reranker_scores(
     edges = [_edge('edge-1'), _edge('edge-2'), _edge('edge-3')]
     client = SimpleNamespace(
         search=AsyncMock(),
-        search_=AsyncMock(
-            return_value=SimpleNamespace(edges=edges, edge_reranker_scores=scores)
-        ),
+        search_=AsyncMock(return_value=SimpleNamespace(edges=edges, edge_reranker_scores=scores)),
     )
     service = SimpleNamespace(get_client=AsyncMock(return_value=client))
     cfg = GraphitiConfig()
@@ -197,6 +194,33 @@ async def test_bm25_fact_search_exposes_available_reranker_scores(
             assert 'score' not in fact
         else:
             assert fact['score'] == expected_score
+
+
+@pytest.mark.asyncio
+async def test_bm25_fact_search_suppresses_scores_for_centered_search(monkeypatch):
+    """center_node_uuid selects the node_distance reranker, whose scores are
+    per SOURCE NODE. Core expands one node score across every edge sharing that
+    source, so the list is not index-aligned with the returned edges — emitting
+    it would attach another node's score to a fact. Scores must be omitted."""
+    edges = [_edge('edge-1'), _edge('edge-2'), _edge('edge-3')]
+    client = SimpleNamespace(
+        search=AsyncMock(),
+        search_=AsyncMock(
+            # one score for a single source node shared by three edges
+            return_value=SimpleNamespace(edges=edges, edge_reranker_scores=[0.9])
+        ),
+    )
+    service = SimpleNamespace(get_client=AsyncMock(return_value=client))
+    cfg = GraphitiConfig()
+    cfg.graphiti.search_mode = 'bm25'
+    monkeypatch.setattr(server, 'graphiti_service', service)
+    monkeypatch.setattr(server, 'config', cfg, raising=False)
+
+    response = await server.search_memory_facts('query', max_facts=3, center_node_uuid='center')
+
+    assert len(response['facts']) == 3
+    for fact in response['facts']:
+        assert 'score' not in fact
 
 
 @pytest.mark.asyncio

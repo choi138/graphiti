@@ -228,9 +228,7 @@ def _node_read_search_config(
     )
 
 
-def _edge_bm25_search_config(
-    max_facts: int, center_node_uuid: str | None
-) -> SearchConfig:
+def _edge_bm25_search_config(max_facts: int, center_node_uuid: str | None) -> SearchConfig:
     return SearchConfig(
         edge_config=EdgeSearchConfig(
             search_methods=[EdgeSearchMethod.bm25],
@@ -676,7 +674,15 @@ async def search_memory_facts(
                 search_filter=search_filter,
             )
             relevant_edges = results.edges[:max_facts] if results.edges else []
-            scores = list(results.edge_reranker_scores or [])[:max_facts]
+            # The node_distance reranker (used only when center_node_uuid is
+            # given) scores SOURCE NODES, not edges: core expands one node
+            # score into every edge sharing that source, so the score list is
+            # not index-aligned with the returned edges. Suppress scores there
+            # rather than attach a neighbouring node's value to a fact.
+            if center_node_uuid:
+                scores = []
+            else:
+                scores = list(results.edge_reranker_scores or [])[:max_facts]
         else:
             relevant_edges = await client.search(
                 group_ids=effective_group_ids,
